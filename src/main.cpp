@@ -1,13 +1,19 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SdFat.h>
 #include "wiring_private.h" // pinPeripheral() function
 #include <AceRoutine.h>
 #include <AceTime.h>
 // #include <Adafruit_GPS.h>
 #include <TinyGPSPlus.h>
+#include <Statistic.h>
+#include <CircularBuffer.h>
 #include <Regexp.h>
+#include <SerialTransfer.h>
 extern "C"
 {
-#include "rtcFunctions.h"
+  #include "rtcFunctions.h"
 }
 
 // Serial port used by GPS module
@@ -19,6 +25,12 @@ extern "C"
 #define PIN_SENSOR_TX 18  // PA04
 #define PAD_SENSOR_TX (UART_TX_PAD_0)
 
+// Pins used to transfer serial data to LoRaWAN on loraSerial
+#define PIN_LORA_RX 17  // PB09
+#define PAD_LORA_RX (SERCOM_RX_PAD_1)
+#define PIN_LORA_TX 16  // PB08
+#define PAD_LORA_TX (UART_TX_PAD_0)
+
 // using ace_time::acetime_t;
 // using ace_time::TimeZone;
 // using ace_time::BasicZoneProcessor;
@@ -28,6 +40,10 @@ extern "C"
 using namespace ace_routine;
 using namespace ace_time;
 
+static boolean displayCollectionDetail = false;
+static boolean displayRegexDetail = false;
+static boolean displayRtcDetail = false;
+static boolean displayGpsDetail = false;
 static TinyGPSPlus gps;
 static boolean rtcValid = false;
 static BasicZoneProcessor losAngelesProcessor;
@@ -40,7 +56,8 @@ static TimeZone utcTz = TimeZone::forZoneInfo(
     &zonedb::kZoneUTC,
     &utcProcessor);
 
-// Uart sensorSerial(&sercom0, 13, 12, SERCOM_RX_PAD_1, UART_TX_PAD_0);
+static SerialTransfer sensorTransfer;
+
 Uart sensorSerial( &sercom0, PIN_SENSOR_RX, PIN_SENSOR_TX, PAD_SENSOR_RX, PAD_SENSOR_TX );
 void SERCOM0_0_Handler()
 {
@@ -59,6 +76,24 @@ void SERCOM0_3_Handler()
   sensorSerial.IrqHandler();
 }
 
+Uart loraSerial( &sercom4, PIN_LORA_RX, PIN_LORA_TX, PAD_LORA_RX, PAD_LORA_TX );
+void SERCOM4_0_Handler()
+{
+  loraSerial.IrqHandler();
+}
+void SERCOM4_1_Handler()
+{
+  loraSerial.IrqHandler();
+}
+void SERCOM4_2_Handler()
+{
+  loraSerial.IrqHandler();
+}
+void SERCOM4_3_Handler()
+{
+  loraSerial.IrqHandler();
+}
+
 class GpsReadCoroutine : public Coroutine
 {
 public:
@@ -73,21 +108,27 @@ public:
         {
           if (gps.encode(GPSSerial.read()))
           {
-            // displayInfo();
+            if (displayGpsDetail)
+            {
+              displayGpsInfo();
+            }
             // if both gps.time and gps.date are valid, then process RTC
             if (gps.time.isValid() & gps.date.isValid())
             {
               // If RTC has never been updated or it's time for an update
               if ((rtcLastUpdated == 0) | ((rtcGetUnixTime() - rtcLastUpdated) >= rtcUpdateFrequencySeconds))
               {
-                Serial.print(F("RTC updated: "));
                 utcTime = ZonedDateTime::forComponents(
                     gps.date.year(), gps.date.month(), gps.date.day(), gps.time.hour(), gps.time.minute(), gps.time.second(), utcTz);
                 rtcSetUnixTime(utcTime.toUnixSeconds());
                 rtcLastUpdated = rtcGetUnixTime();
                 rtcValid = true;
-                utcTime.printTo(SERIAL_PORT_MONITOR);
-                SERIAL_PORT_MONITOR.println();
+                if (displayRtcDetail)
+                {
+                  Serial.print(F("RTC updated: "));
+                  utcTime.printTo(SERIAL_PORT_MONITOR);
+                  SERIAL_PORT_MONITOR.println();
+                }
               }
             }
           }
@@ -102,11 +143,11 @@ private:
   uint32_t gpsCollectTimer;
   uint16_t gpsSentenceCollectionSeconds = 1;
   uint32_t rtcLastUpdated = 0;
-  uint32_t rtcUpdateFrequencySeconds = 30 * 60; // update every 30 minutes
+  uint32_t rtcUpdateFrequencySeconds = 120 * 60; // update every two hours
   ZonedDateTime utcTime = ZonedDateTime::forComponents(
       1970, 1, 1, 0, 0, 0, utcTz);
 
-  void displayInfo()
+  void displayGpsInfo()
   {
     Serial.print(F("Characters processed: "));
     Serial.print(gps.charsProcessed());
@@ -190,7 +231,7 @@ public:
         // high for at least 20 microseconds. This may be longer, but must
         // be low before the end of the range cycle or readings will become
         // continuous.
-        delay(1);
+        delayMicroseconds(30);
         digitalWrite(11,LOW);
         // wait for the end of range cycle (~148mS for MB7389)
         delay(150);
@@ -198,8 +239,8 @@ public:
         while (sensorSerial.available())
         {
           ch = sensorSerial.read();
-          Serial.print(ch);
-          if((strIndex < MaxChars) && isAlphaNumeric(ch))
+          // Serial.print(ch);
+          if((strIndex < maxChars) && isAlphaNumeric(ch))
           {
               strValue[strIndex++] = ch; // add alphanumeric character to the string;
           }
@@ -219,43 +260,40 @@ public:
                   // Serial.println(F("RegEx Match"));
                   //convert the four digits from group zero to a number
                   distance = atoi(matchState.GetCapture (strValue, 0));
-                  #ifdef DEBUG_CAPTURE
-                      ostime_t timestamp = os_getTime();
-                      printEvent(timestamp, "Distance collected", PrintTarget::Serial);
-                      printSpaces(serial, MESSAGE_INDENT);
-                      serial.print(F("strValue: "));
-                      serial.println(strValue);
-                      printSpaces(serial, MESSAGE_INDENT);
-                      serial.print(F("Match start: "));
-                      serial.println(matchState.MatchStart);
-                      printSpaces(serial, MESSAGE_INDENT);
-                      serial.print(F("Match length: "));
-                      serial.println(matchState.MatchLength);
-                      printSpaces(serial, MESSAGE_INDENT);
-                      serial.print(F("Match: "));
+                  if (displayRegexDetail)
+                  {
+                      
+                      Serial.print(F("Distance collected"));
+                      Serial.print(F("strValue: "));
+                      Serial.println(strValue);
+                      Serial.print(F("Match start: "));
+                      Serial.println(matchState.MatchStart);
+                      Serial.print(F("Match length: "));
+                      Serial.println(matchState.MatchLength);
+                      Serial.print(F("Match: "));
                       Serial.println(matchState.GetCapture(strValue, 0));
-                  #endif 
+                  }
               }
               else if (result == REGEXP_NOMATCH)
               {
                   // Serial.println(F("RegEx No Match"));
-                  #ifdef DEBUG_CAPTURE
-                      printEvent(timestamp, "RegEx No Match", PrintTarget::Serial);
-                      printSpaces(serial, MESSAGE_INDENT);
-                      serial.print(F("strValue with no RegEx match: "));
-                      serial.println(strValue);
-                  #endif
+                  if (displayRegexDetail)
+                  {
+                      Serial.println(F("RegexNoMatch"));
+                      Serial.print(F("strValue with no RegEx match: "));
+                      Serial.println(strValue);
+                  }
                   distance = 0;  
               }
               else
               {
                   // Serial.println(F("RegEx Match Error"));
-                  #ifdef DEBUG_CAPTURE
-                      printEvent(timestamp, "RegEx Match Error", PrintTarget::Serial);
-                      printSpaces(serial, MESSAGE_INDENT);
-                      serial.print(F("strValue with RegEx error: "));
-                      serial.println(strValue);
-                  #endif
+                  if (displayRegexDetail)
+                  {
+                      Serial.println(F("RegEx Match Error"));
+                      Serial.print(F("strValue with RegEx error: "));
+                      Serial.println(strValue);
+                  }
                   distance = 0;                  
               }
 
@@ -266,24 +304,153 @@ public:
               // buffer is full or a non-alphanumeric character that is not
               // a carriage return has been found
               // Serial.println(F("non-alphanumeric character that is not a carriage return"));
-              #ifdef DEBUG_CAPTURE
-                  ostime_t timestamp = os_getTime();
-                  printEvent(timestamp, "non-alphanumeric character that is not a carriage return", PrintTarget::Serial);
-                  printSpaces(serial, MESSAGE_INDENT);
-                  serial.print(F("strValue when this occured: "));
+              if (displayCollectionDetail)
+              {
+                  Serial.println(F("non-alphanumeric character that is not a carriage return"));
+                  Serial.print(F("strValue when this occured: "));
                   for ( int i = 0; i < strIndex; ++i )
-                      serial.print(strValue[i]);
-                  serial.println();
-              #endif 
+                      Serial.print(strValue[i]);
+                  Serial.println();
+              }
               strIndex = 0;
           }
         }
         utcTime = ZonedDateTime::forUnixSeconds(rtcGetUnixTime(), utcTz);
-        Serial.print(F("Measurement: "));
-        utcTime.printTo(SERIAL_PORT_MONITOR);
-        Serial.print(F(": "));
-        Serial.print(distance);
-        SERIAL_PORT_MONITOR.println();
+        waterLevelReading.utcTime = rtcGetUnixTime();
+        waterLevelReading.distance = distance;
+
+        // If the sensor returned 0, indicating that nothing was collected,
+        // or if the sensor returns 5000 or 9999, indicating that no target is
+        // visible in the field of view, then don't upload the value.
+        if (waterLevelReading.distance == 0 || waterLevelReading.distance == 5000 || waterLevelReading.distance == 9999)
+        {
+            if (displayCollectionDetail)
+            {
+              Serial.print(F("Water level reading invalid (0, 5000, or 9999)"));
+              Serial.println();
+            }
+        }
+        else
+        {
+            // Serial.print(F("Raw Measurement: "));
+            // utcTime.printTo(SERIAL_PORT_MONITOR);
+            // Serial.print(F(", distance "));
+            // Serial.print(distance);
+            // Serial.print(F(", group count: "));
+            // Add the observation to waterLevelGroup to calculate
+            // count, average, and standard deviation.
+            waterLevelGroup.add(distance);
+            // Push the group of collected datapoints to a queue so
+            // that the water measurements can be accepted or rejected
+            // as a group.
+            queue.push(distance);
+            // Collect groups of ten water level observations.
+            // Serial.print(waterLevelGroup.count());
+            // Serial.print(F(", group average: "));
+            // Serial.print(waterLevelGroup.average());
+            // SERIAL_PORT_MONITOR.println();
+        }
+        if (waterLevelGroup.count() >= 10)
+        {
+            if (displayCollectionDetail)
+            {
+              Serial.print(F("Group count: "));
+              Serial.print(waterLevelGroup.count());
+              Serial.print(F(", group average: "));
+              Serial.print(waterLevelGroup.average());
+              Serial.print(F(", group pop sd: "));
+              Serial.print(waterLevelGroup.pop_stdev());
+              SERIAL_PORT_MONITOR.println();
+            }
+            // If the standard deviation is less than or equal to ten millimeters then accept the group.
+            if (waterLevelGroup.pop_stdev() <= 10)
+            {
+              if (displayCollectionDetail)
+              {
+                Serial.print(F("Group standard deviation less than 10mm; adding to waterLevelGroup"));
+                SERIAL_PORT_MONITOR.println();
+                // Take the measurements set aside in the queue and add them to the main group of
+                // water level statistics.
+                Serial.print(F("adding distances: "));
+              }
+              while (!queue.isEmpty())
+              {
+                // since the group meets the standard deviation limit, add the observations
+                // to the general statistics.
+                uint16_t distanceToadd = queue.pop();
+                waterLevelStats.add(distanceToadd);
+                if (displayCollectionDetail)
+                {
+                  Serial.print(distanceToadd);
+                  Serial.print(F(" "));
+                }
+              }
+              if (displayCollectionDetail)
+              {
+                SERIAL_PORT_MONITOR.println();
+                Serial.print(F("waterLevelStats: "));
+                utcTime.printTo(SERIAL_PORT_MONITOR);
+                Serial.print(F(", count: "));
+                Serial.print(waterLevelStats.count());
+                Serial.print(F(", average: "));
+                Serial.print(waterLevelStats.average());
+                Serial.print(F(", pop sd: "));
+                Serial.print(waterLevelStats.pop_stdev());
+                SERIAL_PORT_MONITOR.println();
+              }
+              waterLevelGroup.clear();
+              queue.clear();
+            }
+            // If the standard deviation of the sample group is greater than ten millimeters
+            // then reject the group.
+            else
+            {
+              if (displayCollectionDetail)
+              {
+                Serial.print(F("Group standard deviation greater than 10mm, rejecting group"));
+                SERIAL_PORT_MONITOR.println();
+              }
+              waterLevelGroup.clear();
+              queue.clear();
+            }
+        }
+
+        // If it's time to send a message based on the current minute value,
+        // and one has not been sent in the current minute, and at least 30
+        // water level observations have been collected, then transmit the
+        // average of the collected water level values.
+        if (((utcTime.minute() % minutesBetweenSend) == 0) & (utcTime.minute() != minuteLastSent) & (waterLevelStats.count() >= 30))
+        {
+            
+            minuteLastSent = utcTime.minute();
+            measurementsSinceLastSend = 0;
+            if (displayCollectionDetail)
+            {
+              Serial.print(F("Measurement Ready: "));
+              utcTime.printTo(SERIAL_PORT_MONITOR);
+              Serial.print(F(", count: "));
+              Serial.print(waterLevelStats.count());
+              Serial.print(F(", average: "));
+              Serial.print(waterLevelStats.average());
+              Serial.print(F(", pop sd: "));
+              Serial.print(waterLevelStats.pop_stdev());
+              Serial.print(F(", variance: "));
+              Serial.print(waterLevelStats.variance());
+              Serial.print(F(", sending --> "));
+              Serial.print(F("time: "));
+              Serial.print(waterLevelReading.utcTime);
+              Serial.print(F(" ("));
+              utcTime.forUnixSeconds(waterLevelReading.utcTime,utcTz).printTo(SERIAL_PORT_MONITOR);
+              Serial.print(F(") "));
+              Serial.print(F(", distance: "));
+              Serial.print(round(waterLevelStats.average()));
+              SERIAL_PORT_MONITOR.println();
+            }
+            waterLevelReading.distance = waterLevelStats.average();
+            sensorTransfer.sendDatum(waterLevelReading);
+            waterLevelStats.clear();
+        }
+                
       }
       COROUTINE_DELAY_SECONDS(sensorBetweenReadSeconds);
     }
@@ -293,12 +460,29 @@ private:
   char ch;
   MatchState matchState; // match state object for regex
   uint16_t distance;
-  const int MaxChars = 20;        // Size of longest string returned by the MB7389
-  char strValue[21];              // must be big enough for characters and terminating null
-  int strIndex = 0;               // the index into the array storing the received characters
-  String regEx = "^R(%d%d%d%d)";  // regular expression pattern to extract from strValue
-  uint16_t sensorBetweenReadSeconds = 10;
+  const int8_t maxChars = 20;       // size of longest string returned by the MB7389
+  char strValue[21];                // string big enough for characters and terminating null (maxChars +1)
+  int strIndex = 0;                 // the index into the array storing the received characters
+  String regEx = "^R(%d%d%d%d)";    // regular expression pattern to extract from strValue
+  uint16_t minutesBetweenSend = 6;  // send measurement every 6 minutes
+  uint8_t minuteLastSent = 61;      // Minute in which last measurement is sent (only send once in a minute
+                                    // period even if there are multiple readings withing that minute).
+                                    // Initially set to 61 so that an initial reading gets sent.
+  uint16_t sensorBetweenReadSeconds = 6; //seconds between sensor readings
+  uint8_t measurementsSinceLastSend = 0;
   ZonedDateTime utcTime;
+  struct STRUCT
+  {
+    uint32_t utcTime;
+    uint16_t distance;
+  } waterLevelReading;
+  statistic::Statistic<float, uint32_t, true> waterLevelStats;
+  statistic::Statistic<float, uint32_t, true> waterLevelGroup;
+  CircularBuffer<uint16_t, 20> queue;
+  void displayGroupInfo()
+  {
+
+  }
 };
 
 class PrintRtcCoroutine : public Coroutine
@@ -312,9 +496,12 @@ public:
       if (rtcValid)
       {
         utcTime = ZonedDateTime::forUnixSeconds(rtcGetUnixTime(), utcTz);
-        Serial.print(F("Current RTC: "));
-        utcTime.printTo(SERIAL_PORT_MONITOR);
-        SERIAL_PORT_MONITOR.println();
+        if (displayRtcDetail)
+        {
+          Serial.print(F("Current RTC: "));
+          utcTime.printTo(SERIAL_PORT_MONITOR);
+          SERIAL_PORT_MONITOR.println();
+        }
       }
       COROUTINE_DELAY_SECONDS(rtcBetweenPrintSeconds);
     }
@@ -325,10 +512,8 @@ private:
   ZonedDateTime utcTime;
 };
 
-
-
 GpsReadCoroutine readGps;
-PrintRtcCoroutine printRtc;
+// PrintRtcCoroutine printRtc;
 GetMeasurementCoroutine getMeasurement;
 
 void setup()
@@ -342,8 +527,7 @@ void setup()
   digitalWrite(11,LOW);
 
   Serial.begin(115200);
-  Serial.println("Initializing GPS");
-
+ 
   GPSSerial.begin(9600, SERIAL_8N1);
   // uncomment this line to turn on RMC (recommended minimum) and GGA (fix data) including altitude
   // GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
@@ -359,11 +543,16 @@ void setup()
   pinPeripheral(PIN_SENSOR_RX, PIO_SERCOM_ALT);
   pinPeripheral(PIN_SENSOR_TX, PIO_SERCOM_ALT);
 
+  loraSerial.begin(115200, SERIAL_8N1);
+  // Assign lora pins to SERCOM_ALT functionality
+  pinPeripheral(PIN_LORA_RX, PIO_SERCOM_ALT);
+  pinPeripheral(PIN_LORA_TX, PIO_SERCOM_ALT);
+  sensorTransfer.begin(loraSerial);
 
   delay(1000);
 
   readGps.setName("readGps");
-  printRtc.setName("printGps");
+  // printRtc.setName("printGps");
   getMeasurement.setName("getMeasurement");
 
 #if !defined(EPOXY_DUINO)
