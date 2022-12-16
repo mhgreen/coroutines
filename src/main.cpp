@@ -41,12 +41,9 @@ extern "C"
 
 // Pins used for water and air temperature
 #define ONE_WIRE_BUS_1 9  // PA19
-#define ONE_WIRE_BUS_2 10  // PA20
 
-static OneWire oneWireAir(ONE_WIRE_BUS_1);
-static OneWire oneWireDock(ONE_WIRE_BUS_2);
+static OneWire oneWireDock(ONE_WIRE_BUS_1);
 
-static DallasTemperature dockAirTemperature(&oneWireAir);
 static DallasTemperature dockWaterTemperature(&oneWireDock);
 
 using namespace ace_routine;
@@ -78,7 +75,7 @@ static char strRtc[] = "RTC";
 static char strDisplay[] = "DISPLAY";
 
 static String regEx = "^R(%d%d%d%d)";    // regular expression pattern to extract distance from sensor
-uint16_t popSd = 10;  // maximum allowable population standard deviation 
+static uint16_t popSd = 10;  // maximum allowable population standard deviation 
 
 void displayRtcInfo()
 {
@@ -446,7 +443,7 @@ public:
       // Collect measurements if RTC is valid
       if (rtcValid)
       {
-        dockAirTemperature.requestTemperatures();
+        dockWaterTemperature.requestTemperatures();
         distance = 0;
         // Clear serial buffer prior to getting a reading
         while (sensorSerial.available())
@@ -546,13 +543,13 @@ public:
           }
         }
         utcTime = ZonedDateTime::forUnixSeconds(rtcGetUnixTime(), utcTz);
-        waterLevelReading.utcTime = rtcGetUnixTime();
-        waterLevelReading.distance = distance;
+        waterReading.utcTime = rtcGetUnixTime();
+        waterReading.distance = distance;
 
         // If the sensor returned 0, indicating that nothing was collected,
         // or if the sensor returns 5000 or 9999, indicating that no target is
         // visible in the field of view, then don't upload the value.
-        if (waterLevelReading.distance == 0 || waterLevelReading.distance == 5000 || waterLevelReading.distance == 9999)
+        if (waterReading.distance == 0 || waterReading.distance == 5000 || waterReading.distance == 9999)
         {
             if (displayCollectionDetail)
             {
@@ -627,8 +624,13 @@ public:
                 Serial.print(F(", pop sd: "));
                 Serial.print(waterLevelStats.pop_stdev());
                 Serial.println();
-                Serial.print(F("Dock air temperature: "));
-                Serial.println(dockAirTemperature.getTempCByIndex(0));
+                // Serial.println(F("Dock water temperature: "));
+                // Serial.print(F("    degrees C from getTempCByIndex: "));
+                // waterTempC = dockWaterTemperature.getTempCByIndex(0);
+                // Serial.println(waterTempC);
+                // waterTempRaw = dockWaterTemperature.celsiusToRaw(waterTempC);
+                // Serial.print(F("    1/128 degree C: "));
+                // Serial.println(waterTempRaw);
               }
               waterLevelGroup.clear();
               queue.clear();
@@ -663,6 +665,8 @@ public:
             
             minuteLastSent = utcTime.minute();
             measurementsSinceLastSend = 0;
+            waterTempC = dockWaterTemperature.getTempCByIndex(0);
+            waterReading.waterTemp = dockWaterTemperature.celsiusToRaw(waterTempC);
             if (displayCollectionDetail)
             {
               Serial.print(F("Measurement Ready: "));
@@ -677,16 +681,21 @@ public:
               Serial.print(waterLevelStats.variance());
               Serial.print(F(", sending --> "));
               Serial.print(F("time: "));
-              Serial.print(waterLevelReading.utcTime);
+              Serial.print(waterReading.utcTime);
               Serial.print(F(" ("));
-              utcTime.forUnixSeconds(waterLevelReading.utcTime,utcTz).printTo(Serial);
+              utcTime.forUnixSeconds(waterReading.utcTime,utcTz).printTo(Serial);
               Serial.print(F(") "));
               Serial.print(F(", distance: "));
               Serial.print(round(waterLevelStats.average()));
               Serial.println();
+              Serial.println(F("Dock water temperature: "));
+              Serial.print(F("    degrees C from getTempCByIndex: "));
+              Serial.println(waterTempC);
+              Serial.print(F("    1/128 degree C: "));
+              Serial.println(waterReading.waterTemp);
             }
-            waterLevelReading.distance = waterLevelStats.average();
-            sensorTransfer.sendDatum(waterLevelReading);
+            waterReading.distance = waterLevelStats.average();
+            sensorTransfer.sendDatum(waterReading);
             waterLevelStats.clear();
         }
                 
@@ -696,9 +705,11 @@ public:
   }
 
 private:
-  char ch;
+  char ch; 
   MatchState matchState; // match state object for regex
   uint16_t distance;
+  float waterTempC;
+  // int16_t waterTempRaw;
   const int8_t maxChars = 20;       // size of longest string returned by the MB7389
   char strValue[21];                // string big enough for characters and terminating null (maxChars +1)
   int strIndex = 0;                 // the index into the array storing the received characters
@@ -714,7 +725,8 @@ private:
   {
     uint32_t utcTime;
     uint16_t distance;
-  } waterLevelReading;
+    int16_t waterTemp;
+  } waterReading;
   statistic::Statistic<float, uint32_t, true> waterLevelStats;
   statistic::Statistic<float, uint32_t, true> waterLevelGroup;
   CircularBuffer<uint16_t, 20> queue;
@@ -779,7 +791,8 @@ void setup()
   pinPeripheral(PIN_LORA_TX, PIO_SERCOM_ALT);
   sensorTransfer.begin(loraSerial);
 
-  dockAirTemperature.begin();
+  dockWaterTemperature.setResolution(10);
+  dockWaterTemperature.begin();
 
   delay(1000);
 
